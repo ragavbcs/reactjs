@@ -62,89 +62,11 @@ Content-Type: application/json
 
 ---
 
-## Dry Run (What-If)
-
-Before running any deployment (Steps 2, 3, or 4), you can preview exactly what Azure will create, modify, or delete — without making any actual changes. This is the ARM equivalent of `terraform plan`.
-
-### What-If URL Pattern
-
-Replace the deployment `PUT` with a `POST` to the same URL with `/whatIf` appended:
-
-```
-POST https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/resourceGroups/az-vorwerk-rg/providers/Microsoft.Resources/deployments/{DEPLOYMENT_NAME}/whatIf?api-version=2021-04-01
-```
-
-**Headers:**
-```
-Authorization: Bearer <BEARER_TOKEN>
-Content-Type: application/json
-```
-
-**Body:** Identical to the corresponding deployment body (same JSON — no changes needed).
-
-### What-If Response
-
-The operation is async — HTTP `202 Accepted` with `Azure-AsyncOperation` or `Location` header. Poll until `"status": "Succeeded"`, then read the `properties.changes` array:
-
-```json
-{
-  "status": "Succeeded",
-  "properties": {
-    "changes": [
-      {
-        "resourceId": "/subscriptions/.../providers/Microsoft.Compute/disks/sql-vorwerk-data",
-        "changeType": "Create",
-        "before": null,
-        "after": { "location": "westeurope", "sku": { "name": "Premium_LRS" }, "..." : "..." }
-      },
-      {
-        "resourceId": "/subscriptions/.../providers/Microsoft.Compute/disks/sql-vorwerk-log",
-        "changeType": "NoChange",
-        "before": { "..." : "..." },
-        "after": { "..." : "..." }
-      }
-    ]
-  }
-}
-```
-
-### Change Types
-
-| changeType | Meaning |
-|---|---|
-| `Create` | Resource does not exist — will be created |
-| `Modify` | Resource exists — one or more properties will change |
-| `NoChange` | Resource exists and is already in the desired state — no action |
-| `Delete` | Resource will be deleted (only occurs in `Complete` mode) |
-| `Ignore` | Resource is out of scope (e.g. pre-existing resources not in template) |
-| `Unsupported` | Resource type does not support What-If |
-
-### Dry Run Flow
-
-Run What-If for each deployment before the real apply:
-
-```
-Step 2 What-If  →  POST .../deploy-sql-disks-nic/whatIf   (preview disks + NIC)
-Step 2 Apply    →  PUT  .../deploy-sql-disks-nic
-
-Step 3 What-If  →  POST .../deploy-sql-vm/whatIf           (preview VM)
-Step 3 Apply    →  PUT  .../deploy-sql-vm
-
-Step 4 What-If  →  POST .../deploy-sql-iaas/whatIf         (preview SQL IaaS)
-Step 4 Apply    →  PUT  .../deploy-sql-iaas
-```
-
-> **Note:** What-If uses the same `Azure-AsyncOperation` polling as regular deployments. Poll until `Succeeded`, then inspect `properties.changes` — if all changes look correct, proceed with the real `PUT`.
-
----
-
 ## CREATE Flow
 
 ```
 Step 1  →  Acquire Bearer Token
-Step 2  →  Deploy: Disks + NIC             (4 resources in 1 deployment, all parallel)
-Step 3  →  Deploy: Virtual Machine         (1 resource, depends on Step 2 completing)
-Step 4  →  Deploy: SQL IaaS Extension      (1 resource, depends on Step 3 completing)
+Step 2  →  Deploy Everything (single ARM template — all 6 resources, dependsOn handles order)
 ```
 
 ---
@@ -184,15 +106,18 @@ grant_type=client_credentials
 
 ---
 
-### Step 2 — Deploy Disks + NIC
+### Step 2 — Deploy All Resources (Single Template)
 
-Creates all three data disks and the NIC in a single deployment. Azure provisions them in parallel internally.
+One deployment that creates all 6 resources. Azure respects the `dependsOn` order internally:
+- Disks and NIC are provisioned in parallel (no dependencies)
+- VM waits for all 3 disks and the NIC
+- SQL IaaS Extension waits for the VM
 
 **Method:** `PUT`
 
 **URL:**
 ```
-https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/resourceGroups/az-vorwerk-rg/providers/Microsoft.Resources/deployments/deploy-sql-disks-nic?api-version=2021-04-01
+https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/resourceGroups/az-vorwerk-rg/providers/Microsoft.Resources/deployments/deploy-sql-vm-full?api-version=2021-04-01
 ```
 
 **Body:**
@@ -255,46 +180,18 @@ https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/
               }
             ]
           }
-        }
-      ]
-    }
-  }
-}
-```
-
-**Response / Notes:**
-- HTTP `201 Created` — asynchronous deployment.
-- Poll the `Azure-AsyncOperation` header URL until `"status": "Succeeded"`.
-- Expected duration: 1–2 minutes.
-- Do **not** proceed to Step 3 until this deployment is `Succeeded`.
-
----
-
-### Step 3 — Deploy Virtual Machine
-
-Attaches the three disks and NIC created in Step 2. All referenced resources must be in `Succeeded` state.
-
-**Method:** `PUT`
-
-**URL:**
-```
-https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/resourceGroups/az-vorwerk-rg/providers/Microsoft.Resources/deployments/deploy-sql-vm?api-version=2021-04-01
-```
-
-**Body:**
-```json
-{
-  "properties": {
-    "mode": "Incremental",
-    "template": {
-      "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-      "contentVersion": "1.0.0.0",
-      "resources": [
+        },
         {
           "type": "Microsoft.Compute/virtualMachines",
           "apiVersion": "2023-09-01",
           "name": "mysql-vorwerk-poc",
           "location": "westeurope",
+          "dependsOn": [
+            "sql-vorwerk-data",
+            "sql-vorwerk-log",
+            "sql-vorwerk-tempdb",
+            "mysql-vorwerk-poc-nic"
+          ],
           "properties": {
             "hardwareProfile": {
               "vmSize": "Standard_D2as_v4"
@@ -359,46 +256,15 @@ https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/
               ]
             }
           }
-        }
-      ]
-    }
-  }
-}
-```
-
-**Response / Notes:**
-- HTTP `201 Created` — asynchronous deployment.
-- Poll the `Azure-AsyncOperation` header URL until `"status": "Succeeded"`.
-- Expected duration: 5–15 minutes.
-- Do **not** proceed to Step 4 until this deployment is `Succeeded`.
-
----
-
-### Step 4 — Deploy SQL IaaS Extension
-
-Registers the VM with the SQL IaaS Agent, enables mixed-mode SQL Authentication, creates the SQL login, and configures storage paths. The VM must be `Running` before this step.
-
-**Method:** `PUT`
-
-**URL:**
-```
-https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/resourceGroups/az-vorwerk-rg/providers/Microsoft.Resources/deployments/deploy-sql-iaas?api-version=2021-04-01
-```
-
-**Body:**
-```json
-{
-  "properties": {
-    "mode": "Incremental",
-    "template": {
-      "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-      "contentVersion": "1.0.0.0",
-      "resources": [
+        },
         {
           "type": "Microsoft.SqlVirtualMachine/sqlVirtualMachines",
           "apiVersion": "2022-07-01-preview",
           "name": "mysql-vorwerk-poc",
           "location": "westeurope",
+          "dependsOn": [
+            "mysql-vorwerk-poc"
+          ],
           "properties": {
             "virtualMachineResourceId": "/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/resourceGroups/az-vorwerk-rg/providers/Microsoft.Compute/virtualMachines/mysql-vorwerk-poc",
             "sqlManagement": "Full",
@@ -451,7 +317,7 @@ https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/
 **Response / Notes:**
 - HTTP `201 Created` — asynchronous deployment.
 - Poll the `Azure-AsyncOperation` header URL until `"status": "Succeeded"`.
-- Expected duration: 5–20 minutes (SQL IaaS Agent installs inside the VM).
+- Expected duration: **15–37 minutes** (dominated by VM creation + SQL IaaS Agent install).
 - After `Succeeded`, connect via SSMS: server `<private IP>`, Authentication `SQL Server Authentication`, Login `<ADMIN_USERNAME>`, Password `<ADMIN_PASSWORD>`, Encryption `Optional`.
 
 ---
@@ -579,23 +445,24 @@ CREATE
 
   [Token]
      |
-     +----------------------------------------+
-     | Deployment: deploy-sql-disks-nic        |
-     |  ├─ Disk: sql-vorwerk-data              |
-     |  ├─ Disk: sql-vorwerk-log               |
-     |  ├─ Disk: sql-vorwerk-tempdb            |
-     |  └─ NIC:  mysql-vorwerk-poc-nic         |
-     +----------------------------------------+
-                          |
-     +----------------------------------------+
-     | Deployment: deploy-sql-vm               |
-     |  └─ VM: mysql-vorwerk-poc               |
-     +----------------------------------------+
-                          |
-     +----------------------------------------+
-     | Deployment: deploy-sql-iaas             |
-     |  └─ SQL IaaS Extension (SQL Auth)       |
-     +----------------------------------------+
+     +------------------------------------------------------------+
+     | Deployment: deploy-sql-vm-full  (single ARM template)      |
+     |                                                            |
+     |   +--------------+  +-----------+  +-----------+  +-----+ |
+     |   | Disk: data   |  | Disk: log |  | Disk: tmp |  | NIC | |  ← parallel
+     |   +--------------+  +-----------+  +-----------+  +-----+ |
+     |          |                |               |           |    |
+     |          +----------------+---------------+-----------+    |
+     |                                   |                        |
+     |                      +------------+----------+             |
+     |                      | VM: mysql-vorwerk-poc |             |  ← waits for all above
+     |                      +-----------------------+             |
+     |                                   |                        |
+     |                      +------------+----------+             |
+     |                      | SQL IaaS Extension    |             |  ← waits for VM
+     |                      | (SQL Auth enabled)    |             |
+     |                      +-----------------------+             |
+     +------------------------------------------------------------+
                           |
                        [DONE]
 
@@ -693,10 +560,8 @@ Check `properties.provisioningState` in the response:
 | Step | Description | Typical Duration |
 |---|---|---|
 | Token | OAuth2 client credentials | < 5 seconds |
-| Step 2 | Deploy Disks + NIC (4 resources, parallel) | 1–2 minutes |
-| Step 3 | Deploy VM | 5–15 minutes |
-| Step 4 | Deploy SQL IaaS Extension | 5–20 minutes |
-| **Total CREATE** | | **~12–37 minutes** |
+| Step 2 | Single deployment: Disks + NIC (parallel) → VM → SQL IaaS | 15–37 minutes |
+| **Total CREATE** | | **~15–37 minutes** |
 | DELETE Step 2 | Delete SQL IaaS Extension | 1–3 minutes |
 | DELETE Step 3 | Delete VM | 2–5 minutes |
 | DELETE Step 4 | Delete NIC | 15–30 seconds |
