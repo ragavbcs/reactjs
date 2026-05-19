@@ -187,10 +187,10 @@ https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/
           "name": "mysql-vorwerk-poc",
           "location": "westeurope",
           "dependsOn": [
-            "sql-vorwerk-data",
-            "sql-vorwerk-log",
-            "sql-vorwerk-tempdb",
-            "mysql-vorwerk-poc-nic"
+            "[resourceId('Microsoft.Compute/disks','sql-vorwerk-data')]",
+            "[resourceId('Microsoft.Compute/disks','sql-vorwerk-log')]",
+            "[resourceId('Microsoft.Compute/disks','sql-vorwerk-tempdb')]",
+            "[resourceId('Microsoft.Network/networkInterfaces','mysql-vorwerk-poc-nic')]"
           ],
           "properties": {
             "hardwareProfile": {
@@ -258,12 +258,30 @@ https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/
           }
         },
         {
+          "type": "Microsoft.Compute/virtualMachines/extensions",
+          "apiVersion": "2023-09-01",
+          "name": "mysql-vorwerk-poc/InitializeDisks",
+          "location": "westeurope",
+          "dependsOn": [
+            "[resourceId('Microsoft.Compute/virtualMachines','mysql-vorwerk-poc')]"
+          ],
+          "properties": {
+            "publisher": "Microsoft.Compute",
+            "type": "CustomScriptExtension",
+            "typeHandlerVersion": "1.10",
+            "autoUpgradeMinorVersion": true,
+            "settings": {
+              "commandToExecute": "powershell -ExecutionPolicy Unrestricted -EncodedCommand JAByAGEAdwAgAD0AIABHAGUAdAAtAEQAaQBzAGsAIAB8ACAAVwBoAGUAcgBlAC0ATwBiAGoAZQBjAHQAIABQAGEAcgB0AGkAdABpAG8AbgBTAHQAeQBsAGUAIAAtAGUAcQAgACcAUgBBAFcAJwAgAHwAIABTAG8AcgB0AC0ATwBiAGoAZQBjAHQAIABOAHUAbQBiAGUAcgAKACQAbABlAHQAdABlAHIAcwAgAD0AIAAnAEYAJwAsACcARwAnACwAJwBIACcACgBmAG8AcgAgACgAJABpAD0AMAA7ACAAJABpACAALQBsAHQAIABbAE0AYQB0AGgAXQA6ADoATQBpAG4AKAAkAHIAYQB3AC4AQwBvAHUAbgB0ACwAJABsAGUAdAB0AGUAcgBzAC4AQwBvAHUAbgB0ACkAOwAgACQAaQArACsAKQAgAHsACgAgACAAIAAgACQAcgBhAHcAWwAkAGkAXQAgAHwAIABJAG4AaQB0AGkAYQBsAGkAegBlAC0ARABpAHMAawAgAC0AUABhAHIAdABpAHQAaQBvAG4AUwB0AHkAbABlACAARwBQAFQAIAAtAFAAYQBzAHMAVABoAHIAdQAgAHwACgAgACAAIAAgAE4AZQB3AC0AUABhAHIAdABpAHQAaQBvAG4AIAAtAEQAcgBpAHYAZQBMAGUAdAB0AGUAcgAgACQAbABlAHQAdABlAHIAcwBbACQAaQBdACAALQBVAHMAZQBNAGEAeABpAG0AdQBtAFMAaQB6AGUAIAB8AAoAIAAgACAAIABGAG8AcgBtAGEAdAAtAFYAbwBsAHUAbQBlACAALQBGAGkAbABlAFMAeQBzAHQAZQBtACAATgBUAEYAUwAgAC0AQwBvAG4AZgBpAHIAbQA6ACQAZgBhAGwAcwBlACAALQBGAG8AcgBjAGUACgB9AAoATgBlAHcALQBJAHQAZQBtACAALQBJAHQAZQBtAFQAeQBwAGUAIABEAGkAcgBlAGMAdABvAHIAeQAgAC0AUABhAHQAaAAgACcARgA6AFwAZABhAHQAYQAnACwAJwBHADoAXABsAG8AZwAnACwAJwBIADoAXAB0AGUAbQBwAEQAYgAnACAALQBGAG8AcgBjAGUACgA="
+            }
+          }
+        },
+        {
           "type": "Microsoft.SqlVirtualMachine/sqlVirtualMachines",
           "apiVersion": "2022-07-01-preview",
           "name": "mysql-vorwerk-poc",
           "location": "westeurope",
           "dependsOn": [
-            "mysql-vorwerk-poc"
+            "[resourceId('Microsoft.Compute/virtualMachines/extensions','mysql-vorwerk-poc','InitializeDisks')]"
           ],
           "properties": {
             "virtualMachineResourceId": "/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/resourceGroups/az-vorwerk-rg/providers/Microsoft.Compute/virtualMachines/mysql-vorwerk-poc",
@@ -317,8 +335,21 @@ https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/
 **Response / Notes:**
 - HTTP `201 Created` — asynchronous deployment.
 - Poll the `Azure-AsyncOperation` header URL until `"status": "Succeeded"`.
-- Expected duration: **15–37 minutes** (dominated by VM creation + SQL IaaS Agent install).
+- Expected duration: **15–40 minutes** (dominated by VM creation + CustomScript disk init + SQL IaaS Agent install).
 - After `Succeeded`, connect via SSMS: server `<private IP>`, Authentication `SQL Server Authentication`, Login `<ADMIN_USERNAME>`, Password `<ADMIN_PASSWORD>`, Encryption `Optional`.
+
+> **CustomScriptExtension — what it does:** The `EncodedCommand` is a base64 UTF-16LE encoded PowerShell script that finds all RAW (unformatted) disks, initializes them as GPT, partitions and formats them NTFS in disk-number order (F: → G: → H:), then creates the `F:\data`, `G:\log`, `H:\tempDb` directories. Decoded script:
+> ```powershell
+> $raw = Get-Disk | Where-Object PartitionStyle -eq 'RAW' | Sort-Object Number
+> $letters = 'F','G','H'
+> for ($i=0; $i -lt [Math]::Min($raw.Count,$letters.Count); $i++) {
+>     $raw[$i] | Initialize-Disk -PartitionStyle GPT -PassThru |
+>     New-Partition -DriveLetter $letters[$i] -UseMaximumSize |
+>     Format-Volume -FileSystem NTFS -Confirm:$false -Force
+> }
+> New-Item -ItemType Directory -Path 'F:\data','G:\log','H:\tempDb' -Force
+> ```
+> To regenerate the base64 string: `python3 -c "import base64; print(base64.b64encode(open('script.ps1').read().encode('utf-16-le')).decode())"`
 
 ---
 
@@ -330,13 +361,14 @@ Resources must be deleted individually in reverse dependency order. ARM template
 Step 1  →  Acquire Bearer Token
 Step 2  →  DELETE SQL IaaS Extension
 Step 3  →  DELETE Virtual Machine
-Step 4  →  DELETE NIC
-Step 5  →  DELETE Data Disk
-Step 6  →  DELETE Log Disk
-Step 7  →  DELETE TempDB Disk
+Step 4  →  DELETE OS Disk
+Step 5  →  DELETE NIC
+Step 6  →  DELETE Data Disk
+Step 7  →  DELETE Log Disk
+Step 8  →  DELETE TempDB Disk
 ```
 
-Steps 5, 6, and 7 are independent and may be submitted in parallel after Step 4 completes.
+Steps 6, 7, and 8 are independent and may be submitted in parallel after Step 5 completes.
 
 ---
 
@@ -375,11 +407,27 @@ https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/
 - HTTP `202 Accepted` — asynchronous.
 - Poll `Azure-AsyncOperation` until `Succeeded`.
 - Expected duration: 2–5 minutes.
-- The OS disk (`sql-vorwerk-poc-osdisk`) is **not** auto-deleted. To delete it with the VM, append `?forceDeletion=true` to the URL.
+- The OS disk (`sql-vorwerk-poc-osdisk`) is **not** reliably auto-deleted even with `?forceDeletion=true`. Always delete it explicitly in Step 4.
 
 ---
 
-### Step 4 — DELETE NIC
+### Step 4 — DELETE OS Disk
+
+**Method:** `DELETE`
+
+**URL:**
+```
+https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/resourceGroups/az-vorwerk-rg/providers/Microsoft.Compute/disks/sql-vorwerk-poc-osdisk?api-version=2023-10-02
+```
+
+**Response / Notes:**
+- HTTP `202 Accepted` — asynchronous.
+- Poll until `Succeeded`.
+- **Must be done before any re-deployment** — ARM will fail with a conflict error if this disk already exists when a new VM deployment runs.
+
+---
+
+### Step 5 — DELETE NIC
 
 **Method:** `DELETE`
 
@@ -395,7 +443,7 @@ https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/
 
 ---
 
-### Step 5 — DELETE Data Disk
+### Step 6 — DELETE Data Disk
 
 **Method:** `DELETE`
 
@@ -406,11 +454,11 @@ https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/
 
 **Response / Notes:**
 - HTTP `202 Accepted` — asynchronous.
-- Steps 5, 6, 7 may run in parallel.
+- Steps 6, 7, 8 may run in parallel.
 
 ---
 
-### Step 6 — DELETE Log Disk
+### Step 7 — DELETE Log Disk
 
 **Method:** `DELETE`
 
@@ -424,7 +472,7 @@ https://management.azure.com/subscriptions/bf18f464-1469-4216-834f-9c6694dbfe26/
 
 ---
 
-### Step 7 — DELETE TempDB Disk
+### Step 8 — DELETE TempDB Disk
 
 **Method:** `DELETE`
 
@@ -459,7 +507,11 @@ CREATE
      |                      +-----------------------+             |
      |                                   |                        |
      |                      +------------+----------+             |
-     |                      | SQL IaaS Extension    |             |  ← waits for VM
+     |                      | CustomScriptExtension |             |  ← initializes disks F/G/H
+     |                      +-----------------------+             |
+     |                                   |                        |
+     |                      +------------+----------+             |
+     |                      | SQL IaaS Extension    |             |  ← waits for disks ready
      |                      | (SQL Auth enabled)    |             |
      |                      +-----------------------+             |
      +------------------------------------------------------------+
@@ -472,6 +524,8 @@ DELETE
                [SQL IaaS Extension]
                           |
                   [VM: mysql-vorwerk-poc]
+                          |
+                [OS Disk: sql-vorwerk-poc-osdisk]
                           |
                   [NIC: mysql-vorwerk-poc-nic]
                           |
@@ -560,23 +614,36 @@ Check `properties.provisioningState` in the response:
 | Step | Description | Typical Duration |
 |---|---|---|
 | Token | OAuth2 client credentials | < 5 seconds |
-| Step 2 | Single deployment: Disks + NIC (parallel) → VM → SQL IaaS | 15–37 minutes |
-| **Total CREATE** | | **~15–37 minutes** |
+| Step 2 | Single deployment: Disks + NIC (parallel) → VM → CustomScript (disk init) → SQL IaaS | 15–40 minutes |
+| **Total CREATE** | | **~15–40 minutes** |
 | DELETE Step 2 | Delete SQL IaaS Extension | 1–3 minutes |
 | DELETE Step 3 | Delete VM | 2–5 minutes |
-| DELETE Step 4 | Delete NIC | 15–30 seconds |
-| DELETE Steps 5–7 | Delete Disks (parallel) | 30–60 seconds |
+| DELETE Step 4 | Delete OS Disk | 30–60 seconds |
+| DELETE Step 5 | Delete NIC | 15–30 seconds |
+| DELETE Steps 6–8 | Delete Disks (parallel) | 30–60 seconds |
 | **Total DELETE** | | **~5–10 minutes** |
 
 ---
 
 ## Notes
 
+### CustomScriptExtension — Disk Initialization
+
+The `Microsoft.SqlVirtualMachine/sqlVirtualMachines` resource's `storageConfigurationSettings` configures SQL Server data/log/tempdb **paths** but does **not** initialize or format raw Windows disks. Without explicit initialization, the 3 data disks remain RAW and invisible in Windows even though they appear attached in the Azure portal.
+
+The `CustomScriptExtension` (resource `mysql-vorwerk-poc/InitializeDisks`) runs before the SQL IaaS extension and handles:
+1. Initializing each RAW disk as GPT
+2. Creating a full-size NTFS partition
+3. Assigning drive letters F: (data), G: (log), H: (tempdb) in disk-number order
+4. Creating the directories `F:\data`, `G:\log`, `H:\tempDb`
+
+This is the correct order: **CustomScriptExtension must complete before SQL IaaS extension runs.**
+
+---
+
 ### OS Disk
 
-The OS disk (`sql-vorwerk-poc-osdisk`) is created implicitly during VM creation. It is **not** deleted automatically when the VM is deleted. Options:
-- Append `?forceDeletion=true` to the VM DELETE URL, or
-- Issue a separate DELETE after the VM is removed.
+The OS disk (`sql-vorwerk-poc-osdisk`) is created implicitly during VM creation. It is **not** reliably deleted even when `?forceDeletion=true` is appended to the VM DELETE URL. Always issue a separate DELETE (Step 4) after the VM is removed. Skipping this step will cause a conflict error on any subsequent re-deployment that uses the same OS disk name.
 
 ### SSMS Connection Settings
 
